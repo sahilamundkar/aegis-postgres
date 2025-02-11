@@ -8,6 +8,7 @@ from src.models.conversation import Conversation, Message
 import os
 from dotenv import load_dotenv
 import json
+from src.services.redis_service import RedisService
 
 class DatabaseService:
     def __init__(self):
@@ -18,15 +19,10 @@ class DatabaseService:
             
         self.engine = create_engine(database_url)
         self.SessionLocal = sessionmaker(bind=self.engine)
+        self.redis_service = RedisService()
 
     @contextmanager
     def get_db(self) -> Generator[Session, None, None]:
-        """
-        Get database session with context management.
-        
-        Returns:
-            Generator yielding SQLAlchemy Session
-        """
         db = self.SessionLocal()
         try:
             yield db
@@ -34,7 +30,7 @@ class DatabaseService:
             db.close()
 
     def create_conversation(self, user_id: str, metadata: Optional[dict] = None) -> Conversation:
-        """Create a new conversation in the database"""
+        """Create a new conversation and cache it"""
         with self.get_db() as db:
             db_conversation = DBConversation(
                 user_id=user_id,
@@ -44,15 +40,23 @@ class DatabaseService:
             db.commit()
             db.refresh(db_conversation)
             
-            return Conversation(
+            conversation = Conversation(
                 id=db_conversation.id,
                 messages=[],
                 questions_asked=metadata.get('questions_asked', 0) if metadata else 0,
                 metadata=metadata or {}
             )
+            
+            # Cache the new conversation
+            self.redis_service.cache_conversation(
+                conversation.id,
+                conversation.dict()
+            )
+            
+            return conversation
 
     def add_message(self, conversation_id: str, role: str, content: str, token_count: int) -> Message:
-        """Add a new message to a conversation"""
+        """Add message to database and update cache"""
         with self.get_db() as db:
             message = DBMessage(
                 conversation_id=conversation_id,
@@ -64,13 +68,27 @@ class DatabaseService:
             db.commit()
             db.refresh(message)
             
-            return Message(
+            msg = Message(
                 role=role,
                 content=content
             )
+            
+            # Update cache with new message
+            self.redis_service.add_message_to_cache(
+                conversation_id,
+                msg.dict()
+            )
+            
+            return msg
 
     def get_conversation(self, conversation_id: str) -> Optional[Conversation]:
-        """Get a conversation by its ID"""
+        """Get conversation from cache or database"""
+        # Try cache first
+        cached_conversation = self.redis_service.get_cached_conversation(conversation_id)
+        if cached_conversation:
+            return Conversation(**cached_conversation)
+        
+        # If not in cache, get from database
         with self.get_db() as db:
             db_conversation = db.query(DBConversation).filter(
                 DBConversation.id == conversation_id
@@ -89,15 +107,23 @@ class DatabaseService:
             
             metadata = json.loads(db_conversation.conversation_metadata) if db_conversation.conversation_metadata else {}
             
-            return Conversation(
+            conversation = Conversation(
                 id=db_conversation.id,
                 messages=messages,
                 questions_asked=metadata.get('questions_asked', 0),
                 metadata=metadata
             )
+            
+            # Cache for future requests
+            self.redis_service.cache_conversation(
+                conversation.id,
+                conversation.dict()
+            )
+            
+            return conversation
 
     def update_conversation_metadata(self, conversation_id: str, metadata: dict):
-        """Update conversation metadata in the database"""
+        """Update metadata in both database and cache"""
         with self.get_db() as db:
             db_conversation = db.query(DBConversation).filter(
                 DBConversation.id == conversation_id
@@ -107,40 +133,11 @@ class DatabaseService:
                 db_conversation.conversation_metadata = json.dumps(metadata)
                 db.commit()
                 db.refresh(db_conversation)
-            else:
-                raise ValueError(f"Conversation with id {conversation_id} not found")
-
-    def get_conversations_for_user(self, user_id: str) -> List[Conversation]:
-        """Get all conversations for a user"""
-        with self.get_db() as db:
-            db_conversations = db.query(DBConversation).filter(
-                DBConversation.user_id == user_id
-            ).all()
-            
-            return [
-                Conversation(
-                    id=conv.id,
-                    messages=[
-                        Message(
-                            role=msg.role,
-                            content=msg.content,
-                            created_at=msg.created_at
-                        ) for msg in conv.messages
-                    ],
-                    questions_asked=json.loads(conv.conversation_metadata).get('questions_asked', 0) if conv.conversation_metadata else 0,
-                    metadata=json.loads(conv.conversation_metadata) if conv.conversation_metadata else {}
-                ) for conv in db_conversations
-            ]
-
-    def delete_conversation(self, conversation_id: str):
-        """Delete a conversation and all its messages"""
-        with self.get_db() as db:
-            db_conversation = db.query(DBConversation).filter(
-                DBConversation.id == conversation_id
-            ).first()
-            
-            if db_conversation:
-                db.delete(db_conversation)
-                db.commit()
+                
+                # Update cache
+                self.redis_service.update_conversation_metadata(
+                    conversation_id,
+                    metadata
+                )
             else:
                 raise ValueError(f"Conversation with id {conversation_id} not found")

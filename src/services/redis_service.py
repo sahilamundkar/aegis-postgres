@@ -1,6 +1,7 @@
 import redis
 import json
 from typing import Optional, Dict, Any
+from datetime import datetime
 from src.config.config import get_settings
 
 class RedisService:
@@ -17,13 +18,31 @@ class RedisService:
         """Generate Redis key for conversation"""
         return f"{self.conversation_prefix}{conversation_id}"
 
+    def serialize_datetime(self, obj):
+        """Convert datetime objects to string for JSON serialization"""
+        if isinstance(obj, datetime):
+            return obj.isoformat()
+        raise TypeError(f"Type {type(obj)} not serializable")
+
+    def deserialize_datetime(self, data):
+        """Convert string back to datetime objects after JSON deserialization"""
+        if isinstance(data, dict):
+            for key, value in data.items():
+                if isinstance(value, str):
+                    try:
+                        data[key] = datetime.fromisoformat(value)
+                    except ValueError:
+                        pass
+        return data
+
     def cache_conversation(self, conversation_id: str, data: Dict[str, Any]) -> None:
         """Cache conversation data in Redis"""
         key = self.get_conversation_cache_key(conversation_id)
+        serialized_data = json.dumps(data, default=self.serialize_datetime)
         self.redis_client.setex(
             key,
             self.cache_ttl,
-            json.dumps(data)
+            serialized_data
         )
 
     def get_cached_conversation(self, conversation_id: str) -> Optional[Dict[str, Any]]:
@@ -31,7 +50,7 @@ class RedisService:
         key = self.get_conversation_cache_key(conversation_id)
         data = self.redis_client.get(key)
         if data:
-            return json.loads(data)
+            return self.deserialize_datetime(json.loads(data))
         return None
 
     def update_conversation_metadata(self, conversation_id: str, metadata: Dict[str, Any]) -> None:
